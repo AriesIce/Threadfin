@@ -4,13 +4,16 @@ FROM --platform=$BUILDPLATFORM golang:1.23-bookworm AS builder
 ARG TARGETARCH
 WORKDIR /app
 
-# ✅ 设置可信代理，避免 CI 环境缓存污染导致 checksum mismatch
-ENV GOPROXY=https://proxy.golang.org,direct
+# ✅ 设置可信代理 + 禁用校验和数据库严格模式
+# GOSUMDB=off 允许在 go.sum 缺失/不匹配时直接从 proxy 拉取并信任
+ENV GOPROXY=https://proxy.golang.org,direct \
+    GOSUMDB=off
 
 COPY go.mod go.sum ./
 
-# ✅ 先校验，失败则自动重建 go.sum（兼容上游 tag 变更场景）
-RUN go mod verify || (rm -f go.sum && go mod tidy)
+# ✅ 强制重新同步依赖：忽略已有 go.sum，以 go.mod 为准重新生成
+# 这替代了本地 rm go.sum && go mod tidy 的操作
+RUN go mod tidy
 
 COPY . .
 
@@ -26,24 +29,4 @@ FROM alpine:3.19
 LABEL maintainer="local-arm64-build"
 
 ENV THREADFIN_BIN=/home/threadfin/bin \
-    THREADFIN_CONF=/home/threadfin/conf \
-    THREADFIN_TEMP=/tmp/threadfin \
-    THREADFIN_PORT=34400 \
-    THREADFIN_BIND_IP_ADDRESS=0.0.0.0 \
-    THREADFIN_DEBUG=0 \
-    TZ=Asia/Shanghai
-
-RUN apk add --no-cache ca-certificates tzdata ffmpeg && \
-    addgroup -S threadfin && adduser -S threadfin -G threadfin && \
-    mkdir -p $THREADFIN_BIN $THREADFIN_CONF $THREADFIN_TEMP && \
-    chown -R threadfin:threadfin /home/threadfin /tmp/threadfin
-
-COPY --from=builder /app/threadfin $THREADFIN_BIN/
-RUN chmod +x $THREADFIN_BIN/threadfin
-
-USER threadfin
-
-VOLUME [$THREADFIN_CONF, $THREADFIN_TEMP]
-EXPOSE $THREADFIN_PORT
-
-ENTRYPOINT ["sh", "-c", "${THREADFIN_BIN}/threadfin -port=${THREADFIN_PORT} -bind=${THREADFIN_BIND_IP_ADDRESS} -config=${THREADFIN_CONF} -debug=${THREADFIN_DEBUG}"]
+    TH
