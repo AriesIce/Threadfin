@@ -1,74 +1,112 @@
-# Stage 1: Build
-FROM --platform=$BUILDPLATFORM golang:1.23-bookworm AS builder
+# First stage. Building a binary
+# -----------------------------------------------------------------------------
+FROM golang:1.23-bullseye AS builder
 
-ARG TARGETARCH
 WORKDIR /app
 
-# ✅ 设置可信代理 + 禁用校验和数据库严格模式
-# GOSUMDB=off 允许在 go.sum 缺失/不匹配时直接从 proxy 拉取并信任
-ENV GOPROXY=https://proxy.golang.org,direct \
-    GOSUMDB=off
-
+# Copy go mod files first for better caching
 COPY go.mod go.sum ./
+RUN go mod download
 
-# ✅ 强制重新同步依赖：忽略已有 go.sum，以 go.mod 为准重新生成
-# 这替代了本地 rm go.sum && go mod tidy 的操作
-RUN go mod tidy
-
+# Copy the source code
 COPY . .
 
-RUN CGO_ENABLED=0 GOARCH=$TARGETARCH go build \
-    -mod=mod \
-    -ldflags="-s -w" \
-    -trimpath \
-    -o threadfin threadfin.go
+# Build the application with optimizations
+RUN CGO_ENABLED=0 go build -mod=mod -ldflags="-s -w" -trimpath -o threadfin threadfin.go
 
-# Stage 2: Runtime (ARM64 optimized)
-FROM alpine:3.19
+# Second stage. Creating a minimal image
+# -----------------------------------------------------------------------------
+FROM ubuntu:24.04
 
-LABEL maintainer="local-arm64-build"
+ARG BUILD_DATE
+ARG VCS_REF
+ARG THREADFIN_PORT=34400
+ARG THREADFIN_VERSION
+ARG TARGETARCH
+ARG OS_VERSION=ubuntu
+ARG OS_CODENAME=noble
 
-# 安装运行时依赖
-RUN apk add --no-cache \
-    ca-certificates \
-    tzdata \
-    ffmpeg \
-    vlc
+LABEL org.label-schema.build-date="${BUILD_DATE}" \
+      org.label-schema.name="Threadfin" \
+      org.label-schema.description="Dockerized Threadfin" \
+      org.label-schema.url="https://hub.docker.com/r/fyb3roptik/threadfin/" \
+      org.label-schema.vcs-ref="${VCS_REF}" \
+      org.label-schema.vcs-url="https://github.com/Threadfin/Threadfin" \
+      org.label-schema.vendor="Threadfin" \
+      org.label-schema.version="${THREADFIN_VERSION}" \
+      org.label-schema.schema-version="1.0" \
+      DISCORD_URL="https://discord.gg/bEPPNP2VG8"
 
-# 创建非 root 用户
-RUN addgroup -g 1000 threadfin && \
-    adduser -D -u 1000 -G threadfin threadfin
-
-# 设置环境变量
 ENV THREADFIN_BIN=/home/threadfin/bin \
-    THREADFIN_HOME=/home/threadfin/data \
-    THREADFIN_PORT=34400
+    THREADFIN_CONF=/home/threadfin/conf \
+    THREADFIN_HOME=/home/threadfin \
+    THREADFIN_TEMP=/tmp/threadfin \
+    THREADFIN_CACHE=/home/threadfin/cache \
+    THREADFIN_UID=31337 \
+    THREADFIN_GID=31337 \
+    THREADFIN_USER=threadfin \
+    THREADFIN_BRANCH=main \
+    THREADFIN_DEBUG=0 \
+    THREADFIN_PORT=34400 \
+    THREADFIN_LOG=/var/log/threadfin.log \
+    THREADFIN_BIND_IP_ADDRESS=0.0.0.0 \
+    PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/home/threadfin/bin \
+    DEBIAN_FRONTEND=noninteractive
 
-# 创建工作目录
-RUN mkdir -p /home/threadfin/bin \
-             /home/threadfin/data \
-             /home/threadfin/logs && \
-    chown -R threadfin:threadfin /home/threadfin
+# Set working directory
+WORKDIR $THREADFIN_HOME
 
-# 从构建阶段复制二进制文件
-COPY --from=builder --chown=threadfin:threadfin /app/threadfin /home/threadfin/bin/threadfin
+# Install dependencies in a single layer
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+    ca-certificates \
+    curl \
+    ffmpeg \
+    vlc \
+    tzdata \
+    gnupg \
+    apt-transport-https && \
+    mkdir -p $THREADFIN_BIN $THREADFIN_CONF $THREADFIN_TEMP $THREADFIN_HOME/cache && \
+    chmod a+rwX $THREADFIN_CONF $THREADFIN_TEMP && \
+    sed -i 's/geteuid/getppid/' /usr/bin/vlc && \
+    curl -fsSL https://repo.jellyfin.org/master/ubuntu/jellyfin_team.gpg.key \
 
-# 复制配置文件（如果有的话）
-COPY --from=builder --chown=threadfin:threadfin /app/html /home/threadfin/bin/html
-COPY --from=builder --chown=threadfin:threadfin /app/templates /home/threadfin/bin/templates
+        | gpg --dearmor -o /etc/apt/trusted.gpg.d/ubuntu-jellyfin.gpg && \
+    (if [ "${TARGETARCH}" = "arm" ]; then \
+        echo "deb [arch=armhf] https://repo.jellyfin.org/master/${OS_VERSION} ${OS_CODENAME} main" > /etc/apt/sources.list.d/jellyfin.list; \
+    else \
+        echo "deb [arch=${TARGETARCH}] https://repo.jellyfin.org/master/${OS_VERSION} ${OS_CODENAME} main" > /etc/apt/sources.list.d/jellyfin.list; \
+    fi) && \
+    apt-get update && \
+    apt-get install --no-install-recommends --no-install-suggests --yes \
+        jellyfin-ffmpeg7 && \
+    apt-get remove gnupg apt-transport-https --yes && \
+    apt-get clean autoclean --yes && \
+    apt-get autoremove --yes && \
+    rm -rf /var/cache/apt/archives* /var/lib/apt/lists/*
 
-# 暴露端口
-EXPOSE 34400
+# Copy built binary from builder image
+COPY --from=builder /app/threadfin $THREADFIN_BIN/
+RUN chmod +rx $THREADFIN_BIN/threadfin
 
-# 切换到非 root 用户
-USER threadfin
+# Create non-root user
+RUN groupadd -g $THREADFIN_GID $THREADFIN_USER && \
+    useradd -u $THREADFIN_UID -g $THREADFIN_USER -d $THREADFIN_HOME -s /bin/bash $THREADFIN_USER && \
+    chown -R $THREADFIN_USER:$THREADFIN_USER $THREADFIN_HOME && \
+    chown -R $THREADFIN_USER:$THREADFIN_USER $THREADFIN_TEMP && \
+    chown $THREADFIN_USER:$THREADFIN_USER /var/log
 
-# 健康检查
+# Configure container volume mappings
+VOLUME $THREADFIN_CONF
+VOLUME $THREADFIN_TEMP
+
+EXPOSE $THREADFIN_PORT
+
+# Switch to non-root user
+USER $THREADFIN_USER
+
+# Health check
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
-    CMD wget --no-verbose --tries=1 --spider http://localhost:34400 || exit 1
+    CMD curl -f http://localhost:$THREADFIN_PORT || exit 1
 
-# 设置工作目录
-WORKDIR /home/threadfin/bin
-
-# 启动命令
-ENTRYPOINT ["./threadfin"]
+ENTRYPOINT ["sh", "-c", "exec ${THREADFIN_BIN}/threadfin -port=${THREADFIN_PORT} -bind=${THREADFIN_BIND_IP_ADDRESS} -config=${THREADFIN_CONF} -debug=${THREADFIN_DEBUG}"]
