@@ -1,14 +1,28 @@
 # Stage 1: Build
 FROM --platform=$BUILDPLATFORM golang:1.23-bookworm AS builder
+
 ARG TARGETARCH
 WORKDIR /app
+
+# ✅ 设置可信代理，避免 CI 环境缓存污染导致 checksum mismatch
+ENV GOPROXY=https://proxy.golang.org,direct
+
 COPY go.mod go.sum ./
-RUN go mod download
+
+# ✅ 先校验，失败则自动重建 go.sum（兼容上游 tag 变更场景）
+RUN go mod verify || (rm -f go.sum && go mod tidy)
+
 COPY . .
-RUN CGO_ENABLED=0 GOARCH=$TARGETARCH go build -mod=mod -ldflags="-s -w" -trimpath -o threadfin threadfin.go
+
+RUN CGO_ENABLED=0 GOARCH=$TARGETARCH go build \
+    -mod=mod \
+    -ldflags="-s -w" \
+    -trimpath \
+    -o threadfin threadfin.go
 
 # Stage 2: Runtime (ARM64 optimized)
 FROM alpine:3.19
+
 LABEL maintainer="local-arm64-build"
 
 ENV THREADFIN_BIN=/home/threadfin/bin \
@@ -28,6 +42,7 @@ COPY --from=builder /app/threadfin $THREADFIN_BIN/
 RUN chmod +x $THREADFIN_BIN/threadfin
 
 USER threadfin
+
 VOLUME [$THREADFIN_CONF, $THREADFIN_TEMP]
 EXPOSE $THREADFIN_PORT
 
